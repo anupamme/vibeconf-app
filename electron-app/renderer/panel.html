@@ -437,6 +437,19 @@
             Add this address as a guest on a Google Calendar event to have this bot join it automatically. It doesn't need to be a real, working email. You can also put <code>#vibeconf:&lt;this bot's name&gt;</code> in the event's title or description instead. Filled in automatically from "Sign in to Google as bot" above, if used.
           </div>
         </div>
+        <!-- Calendar feed (#829): auto-join from ANY calendar app through its
+             published iCal (ICS) link — Outlook, Google, Apple, Fastmail — with
+             no Google sign-in. The link is a secret (it can read the whole
+             calendar), so the input is a password field (the panel gets
+             screen-shared) and main.js never logs it. -->
+        <div class="field" id="calendarFeedField">
+          <label for="calendarFeedSecretUrl">Calendar feed (iCal link)</label>
+          <input type="password" id="calendarFeedSecretUrl" value="" placeholder="https://… or webcal://… ending in .ics" autocomplete="off" spellcheck="false" />
+          <div style="font-size:11px;color:#6B5566;margin-top:2px">
+            Works with any calendar app, no Google sign-in needed. Paste your calendar's secret iCal address: in <strong>Outlook</strong>, Settings → Calendar → Shared calendars → Publish a calendar (choose "Can view all details") → ICS; in <strong>Google Calendar</strong>, the calendar's Settings → "Secret address in iCal format". Meetings in it are joined the same way: invite the email above, or tag the event <code>#vibeconf:&lt;this bot's name&gt;</code>. Keep this link private: anyone with it can read your calendar.
+          </div>
+          <div style="font-size:11px;margin-top:4px" id="calendarFeedStatus"></div>
+        </div>
         <div class="field">
           <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
             <input type="checkbox" id="sessionPerCalendarInvitees" />

@@ -165,6 +165,8 @@ const zoomSignOutBtn = document.getElementById('zoomSignOutBtn');
 // Settings
 const botNameInput = document.getElementById('botName');
 const calendarIdentityEmailInput = document.getElementById('calendarIdentityEmail'); // #299
+const calendarFeedInput = document.getElementById('calendarFeedSecretUrl'); // #829
+const calendarFeedStatusEl = document.getElementById('calendarFeedStatus');
 const websiteUrlInput = document.getElementById('websiteUrl');
 const ttsApiKeyInput = document.getElementById('ttsApiKey');
 const ttsVoiceIdInput = document.getElementById('ttsVoiceId');
@@ -2239,7 +2241,7 @@ api.invoke('get-upcoming-calendar-events').then((r) => {
 // bot in the wizard saw "Unnamed bot" in Settings and reasonably concluded the
 // save had failed, when it had worked (#190, #143).
 function loadConfigIntoControls() {
-  return api.invoke('get-config', ['botName', 'calendarIdentityEmail', 'websiteUrl', 'syncBaseUrl', 'ttsApiKey', 'ttsVoiceId', 'macosVoice', 'voiceboxProfileId', 'ttsProvider', 'claudeWorkDir', 'agentSession', 'sessionPerCalendarInvitees', 'claudeModel', 'emojiSet', 'captionLanguage', 'dangerousMode', 'ackShortMin', 'ackLongMin', 'ackShortPhrases', 'ackLongPhrases', 'lastMeetName', 'lastSlackName', 'realtimeVoice', 'realtimeVoiceName']).then((result) => {
+  return api.invoke('get-config', ['botName', 'calendarIdentityEmail', 'calendarFeedSecretUrl', 'websiteUrl', 'syncBaseUrl', 'ttsApiKey', 'ttsVoiceId', 'macosVoice', 'voiceboxProfileId', 'ttsProvider', 'claudeWorkDir', 'agentSession', 'sessionPerCalendarInvitees', 'claudeModel', 'emojiSet', 'captionLanguage', 'dangerousMode', 'ackShortMin', 'ackLongMin', 'ackShortPhrases', 'ackLongPhrases', 'lastMeetName', 'lastSlackName', 'realtimeVoice', 'realtimeVoiceName']).then((result) => {
   if (result?.botName) {
     botNameInput.value = result.botName;
     currentBotName = result.botName;
@@ -2253,6 +2255,7 @@ function loadConfigIntoControls() {
     }).catch(() => { /* keep the generic placeholder */ });
   }
   calendarIdentityEmailInput.value = result?.calendarIdentityEmail || '';
+  if (calendarFeedInput) calendarFeedInput.value = result?.calendarFeedSecretUrl || '';
   rememberedMeetName = result?.lastMeetName || null;   // #282 remembered names
   rememberedSlackName = result?.lastSlackName || null;
   refreshSlackIdentity();
@@ -3569,6 +3572,35 @@ botNameInput.addEventListener('change', () => {
 // #299: no validation on this — it's a free-text guest email that never needs
 // to resolve to a real mailbox, and calendar-auto-join.js's matching is
 // already trim+lowercase-tolerant, so there's nothing meaningful to reject.
+// Calendar feed (#829): save on change; main re-polls right away and answers
+// with 'calendar-feed-status', so the line under the field says whether it works.
+function paintCalendarFeedStatus(status) {
+  if (!calendarFeedStatusEl) return;
+  const st = status || { state: 'off' };
+  if (st.state === 'ok') {
+    calendarFeedStatusEl.style.color = '#2E7D4F';
+    calendarFeedStatusEl.textContent = `✓ Reading your calendar: ${st.count} event${st.count === 1 ? '' : 's'} in the next day.`;
+  } else if (st.state === 'error') {
+    calendarFeedStatusEl.style.color = '#B3261E';
+    calendarFeedStatusEl.textContent = `⚠️ Can't read this calendar link: ${st.error}.`;
+  } else {
+    calendarFeedStatusEl.textContent = '';
+  }
+}
+if (calendarFeedInput) {
+  calendarFeedInput.addEventListener('change', () => {
+    const v = calendarFeedInput.value.trim();
+    calendarFeedInput.value = v;
+    if (calendarFeedStatusEl) {
+      calendarFeedStatusEl.style.color = '#6B5566';
+      calendarFeedStatusEl.textContent = v ? 'Checking…' : '';
+    }
+    setConfig('calendarFeedSecretUrl', v);
+  });
+  api.on('calendar-feed-status', paintCalendarFeedStatus);
+  api.invoke('get-calendar-feed-status').then(paintCalendarFeedStatus).catch(() => {});
+}
+
 calendarIdentityEmailInput.addEventListener('change', () => {
   setConfig('calendarIdentityEmail', calendarIdentityEmailInput.value.trim());
 });
