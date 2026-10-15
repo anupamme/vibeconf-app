@@ -621,6 +621,9 @@
       // the terminal launching and the agent's first tool call. Stillness there
       // is truthful (nothing is happening yet), and claudeReady would be the
       // signal to cover it if that gap ever wants filling.
+      // Rotation pivot for the face, as a fraction of its size below centre: 2/3
+      // of the way down the face is 1/6 below its middle.
+      const NECK_PIVOT_FROM_CENTRE = 2 / 3 - 1 / 2;
       const PEEK_TILT_SCALE = 0.34;
       const PEEK_SHIFT_PX = 26;
 
@@ -755,7 +758,14 @@
       const postScale = post ? post.scale : 1;
       ctx.translate(cx + postX + thinkSway + peekShift, cy + postY + bob - speakBounce + ghostRise);
       if (speakTilt || tickTilt || agentTiltNow || deadFlip || mentionTilt || gateTilt) {
+        // Tilt around a "neck", not the face's centre. Rotating about the middle
+        // spun the face like a wheel; a pivot two-thirds of the way down reads
+        // as a head tilting (Stan, 2026-10-15). Not at the very bottom — that
+        // swings the top too far for the same angle.
+        const neckY = emojiSize * NECK_PIVOT_FROM_CENTRE;
+        ctx.translate(0, neckY);
         ctx.rotate(speakTilt + tickTilt + agentTiltNow + deadFlip + mentionTilt + gateTilt);
+        ctx.translate(0, -neckY);
       }
       if (this.speaking) {
         ctx.scale(speakScaleX * tickPop * mentionPop * postScale, speakScaleY * tickPop * mentionPop * postScale);
