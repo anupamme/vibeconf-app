@@ -1392,6 +1392,21 @@ function revokeCallLogShare(reason) {
   _sharingWeEnabled = false;
 }
 
+// The Meet URL this app has joined (or is joining), and the last Meet URL the
+// browser-tab poll notified about. ONE variable each, at module scope, shared by
+// every join path (panel, detected-tab, --meet-url, MCP /join-call, calendar),
+// the leave teardown, the browser-tab poll and the #347 guest fallback.
+//
+// These used to be declared with `let` INSIDE app.whenReady(), while the
+// module-level join/teardown/guest-fallback code assigned and read them with no
+// declaration in scope. main.js is sloppy-mode, so those writes silently made a
+// SECOND, implicit global: teardown reset the global and never the poll's copy,
+// and a --meet-url launch set only the inner copy, so the guest fallback's read
+// of the never-created global threw "ReferenceError: currentMeetUrl is not
+// defined" (seen live 2026-10-15) and the guest join never happened.
+let currentMeetUrl = null;
+let detectedMeetUrl = null;
+
 // The actual teardown. It lives here, callable from main, rather than only at
 // the end of a main → renderer → main round trip.
 //
@@ -9886,10 +9901,10 @@ app.whenReady().then(async () => {
 
   // --- Meet/Slack detection: poll Chrome/Safari/Brave tabs for active Meet
   // calls and Slack huddles ---
-  let detectedMeetUrl = null;
+  // currentMeetUrl and detectedMeetUrl are module-level (see their declaration):
+  // the leave teardown resets them, and every join path sets currentMeetUrl.
   let detectedSlackHuddle = null;
   let meetDetectionInterval = null;
-  let currentMeetUrl = null; // Track what we've joined
   let automationPromptShown = false; // only nag about Automation permission once
   // Last Meet-poll failure message, so an identical one isn't logged every tick.
   // null = nothing failing right now; a success clears it, so a recurrence is
@@ -9975,8 +9990,8 @@ allURLs`;
 
     function pollForMeet() {
       if (currentMeetUrl || pollInFlight) return;
-      // Already in a call (joined via the panel OR /join-call MCP, where
-      // currentMeetUrl isn't set)? Don't scan the browser for other Meets —
+      // Already in a call by some path that didn't set currentMeetUrl (Slack,
+      // Zoom, Teams)? Don't scan the browser for other Meets —
       // it's pointless mid-call and was spamming "Google Meet Detected" push
       // notifications (and burning AppleScript timeouts) during live calls.
       if (localServer.callStatus === 'in-call') return;
@@ -14627,6 +14642,11 @@ function setupIPC() {
         }
         localServer.waiters = [];
         localServer.clearRoom();
+        // We never made it into this Meet, so we haven't "joined" it. Now that
+        // currentMeetUrl is one shared variable, leaving it set here would keep
+        // the browser-tab poll paused (it early-returns while it is set) until
+        // some later teardown, which a failed join never reaches.
+        currentMeetUrl = null;
         // Reset the panel UI — without this it keeps showing "leave call"
         // even though we never made it into the meeting.
         // errorAction rides along: the panel re-shows `message` on top of the
