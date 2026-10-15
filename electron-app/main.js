@@ -3473,12 +3473,15 @@ const localServer = new globalThis.LocalServer({
       tts.updateConfig?.({ [key]: value });
     } else if (key === 'botName') {
       applyAllWindowTitles(); // every window is named after the bot, not just the main one
+      pushAvatarPosture();    // the name is part of the posture seed
     } else if (key === 'avatarBackgroundSvg') {
       pushAvatarBackground(value);
       // (The panel re-renders its own avatar — and its switcher thumbnail — off
       // these prefs directly, so nothing to invalidate here.)
     } else if (key === 'emojiSet') {
       pushEmojiSet(value);
+    } else if (key === 'avatarPostureShifts') {
+      pushAvatarPosture();
     } else if (key === 'meetViewSize') {
       applyMeetViewSize();
     } else if (key === 'captionLanguage') {
@@ -3760,6 +3763,21 @@ function warnIfEmptyEmojiDir(value) {
         + '"1f642.png", "1F642.svg" and "emoji_u1f642.png" all work.');
     } catch { /* best-effort */ }
   }
+}
+
+// Per-bot resting posture + occasional posture shifts for the avatar face
+// (avatar-posture.js, drawn in page-inject). The seed is host + profile + bot
+// name, so it is stable for this bot across calls and Meet reloads, and two bots
+// in the same Meet (different machines, profiles or names) sit differently.
+function pushAvatarPosture() {
+  if (!meetView || meetView.webContents.isDestroyed()) return;
+  const def = require('./preferences-schema').PREFERENCES.avatarPostureShifts?.default;
+  const enabled = (store?.get('avatarPostureShifts') ?? def) !== false;
+  const seed = [require('os').hostname(), appProfile, store?.get('botName') || ''].join('|');
+  meetView.webContents.send('extension-message', {
+    action: 'set-avatar-posture',
+    payload: { enabled, seed },
+  });
 }
 
 function pushEmojiSet(value) {
@@ -12808,6 +12826,8 @@ async function _openMeetInFreshView(meetUrl, { guestFallback = false } = {}) {
         });
         updateDebugOverlayPushInterval(true);
       }
+      // Avatar posture seed + on/off, across Meet reloads.
+      pushAvatarPosture();
     }
   });
 }
@@ -13009,6 +13029,7 @@ function setupIPC() {
     // Live-apply the visual prefs the panel can set here (the agent path goes
     // through applyPref, which already pushes these). #316.
     if (key === 'emojiSet') pushEmojiSet(value);
+    if (key === 'avatarPostureShifts' || key === 'botName') pushAvatarPosture();
     if (key === 'meetViewSize') applyMeetViewSize();
     if (key === 'botName') applyAllWindowTitles();
     if (key === 'watchSharedScreen') reconcileScreenSettleWatcher();
