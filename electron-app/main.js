@@ -147,6 +147,10 @@ function ts() {
 // Set in createMainWindow when --provider=slack.
 let slackProviderMode = false;
 let slackSurface = null;
+// Zoom (#318) is one surface like Meet, so it needs no routing here: meetView is
+// the Zoom web-client view and preload-zoom.js handles every command. The flag
+// only tells provider switches and the join path which view is live.
+let zoomProviderMode = false;
 // In Slack mode, ONLY these commands target the huddle POPUP (huddle-UI / DOM
 // ops handled by SlackProvider). Everything else — TTS/play-* (VirtualMic),
 // avatar/engagement (VirtualCamera), etc. — is a page-inject op on the MAIN
@@ -2024,6 +2028,9 @@ const localServer = new globalThis.LocalServer({
     // "confirm in-call + start the loop". For Meet, navigate as before.
     if (slackProviderMode || /^slack-/.test(meetCode || '')) {
       console.log('[local-server] Slack join — bot already in huddle, skipping Meet navigation');
+    } else if (zoomProviderMode || /^zoom-/.test(meetCode || '')) {
+      // Zoom: activateZoomProvider (via onJoinZoom) already loaded the meeting.
+      console.log('[local-server] Zoom join — meeting view already loading, skipping Meet navigation');
     } else {
       const meetUrl = `https://meet.google.com/${meetCode}`;
       // Track what we've joined for EVERY join path — the panel paths set this,
@@ -2076,6 +2083,11 @@ const localServer = new globalThis.LocalServer({
     console.log('[local-server] Join Slack huddle requested by agent:', url);
     activateSlackProvider(url, { autojoin: true });
     return localServer.roomId || null;
+  },
+  onJoinZoom: (url) => {
+    // Programmatic Zoom join (#318), the Zoom analog of onJoinSlack.
+    console.log('[local-server] Join Zoom meeting requested by agent:', url);
+    return activateZoomProvider(url);
   },
   // The agent has finished its after-call work. Ends the phase now instead of
   // waiting out the backstop.
@@ -2957,7 +2969,7 @@ const localServer = new globalThis.LocalServer({
     // "URL navigated" and "actually admitted" is misleading — especially when
     // entry is denied, since that 15s grace window leaves the button visible
     // while we wait for the denial page to be detected.
-    broadcastToRenderers('call-status-changed', { status, provider: slackProviderMode ? 'slack' : 'meet' });
+    broadcastToRenderers('call-status-changed', { status, provider: slackProviderMode ? 'slack' : zoomProviderMode ? 'zoom' : 'meet' });
     // Rebuild the menu bar for the same reason: Call Now and Hang Up are a
     // pair, and exactly one of them should be available. A handful of rebuilds
     // per call (idle → joining → in-call → idle), not a poll.
@@ -6159,6 +6171,25 @@ function notifyMeetSignInNeeded(email) {
 // ground truth for "logged into Slack". We can't name the workspace/user from
 // the cookie alone (that needs the huddle DOM — #283), but we CAN say
 // connected-vs-not, which is all the main panel needs.
+// Zoom's sign-in page, for the bot's Zoom identity (#318).
+const ZOOM_SIGN_IN_URL = 'https://zoom.us/signin';
+
+// Signed into Zoom? Observed on a real sign-in (Google SSO, 2026-10-14): Zoom
+// set _zm_kms (HttpOnly, ~3-month expiry) at the moment of login, and it's the
+// only non-analytics cookie that did. _zm_ssid is Zoom's session id when
+// present. (_zm_everlogin_type is NOT a signal: it means "has ever logged in".)
+// Any failure reads as "not signed in", like the Slack check.
+const ZOOM_SESSION_COOKIES = ['_zm_kms', '_zm_ssid'];
+async function isSignedInToZoom(sess) {
+  try {
+    const all = await sess.cookies.get({});
+    return all.some((c) => /(^|\.)zoom\.us$/.test((c.domain || '').replace(/^\./, ''))
+      && ZOOM_SESSION_COOKIES.includes(c.name) && c.value);
+  } catch {
+    return false;
+  }
+}
+
 async function isSignedInToSlack(sess) {
   try {
     const all = await sess.cookies.get({ domain: '.slack.com' });
@@ -6547,8 +6578,11 @@ function _callTabUrlFragment(callId) {
     }
     return null;
   }
+  // Zoom room ids are "zoom-<meeting number>" → a web-client tab (/wc/<n>/...).
+  // A tab on the /j/ launch page or the desktop app won't match; best-effort.
+  if (/^zoom-\d+$/.test(callId)) return '/wc/' + String(callId).slice(5);
   // Default: a Google Meet code → meet.google.com/<code>.
-  // (Future: zoom.us/j/<id>, teams.microsoft.com/... — add branches here.)
+  // (Future: teams.microsoft.com/... — add branches here.)
   const code = String(callId).replace(/[^a-zA-Z0-9-]/g, '');
   return code ? 'meet.google.com/' + code : null;
 }
@@ -10634,10 +10668,11 @@ app.on('before-quit', () => {
 // / #170). Handles all per-view setup that the previous inline block did:
 // audio muting, zoom on dom-ready, and optional DevTools open at launch.
 // Returns the view; caller is responsible for addBrowserView + load.
-function createMeetView(partition) {
+// `preload` swaps in another single-surface provider's preload (Zoom, #318).
+function createMeetView(partition, { preload = 'preload-meet.js' } = {}) {
   const view = new BrowserView({
     webPreferences: {
-      preload: path.join(__dirname, 'preload-meet.js'),
+      preload: path.join(__dirname, preload),
       contextIsolation: false,
       sandbox: false,
       partition,
@@ -11400,6 +11435,7 @@ function activateSlackProvider(slackUrl, { autojoin = true } = {}) {
   });
   meetView = surface.view;
   slackProviderMode = true;
+  zoomProviderMode = false;
   slackSurface = surface;
   mainWindow.addBrowserView(meetView);
   layoutViews();
@@ -11411,11 +11447,12 @@ function activateSlackProvider(slackUrl, { autojoin = true } = {}) {
 // Ensure the embedded view is a Google Meet view (switching back from Slack if
 // needed) before loading a Meet URL.
 function activateMeetProvider() {
-  if (!slackProviderMode && meetView && !meetView.webContents.isDestroyed()) return;
+  if (!slackProviderMode && !zoomProviderMode && meetView && !meetView.webContents.isDestroyed()) return;
   if (!mainWindow || mainWindow.isDestroyed()) return;
-  console.log('[electron] Activating Meet provider (was slack=' + slackProviderMode + ')');
+  console.log('[electron] Activating Meet provider (was slack=' + slackProviderMode + ', zoom=' + zoomProviderMode + ')');
   destroyProviderView();
   slackProviderMode = false;
+  zoomProviderMode = false;
   slackSurface = null;
   // #347: follows the active partition, so a provider switch mid-fallback
   // doesn't silently drop the bot back onto the blocked account.
@@ -11423,6 +11460,64 @@ function activateMeetProvider() {
   meetView = createMeetView(activeMeetPartition);
   attachMeetViewForState(); // #103: hidden host / popout / main window, per state
   layoutViews();
+}
+
+// Room code for a Zoom meeting (zoom-<number>) → local server + sync, the Zoom
+// analog of setupSlackRoom.
+function setupZoomRoom(zoomUrl) {
+  const { ZOOM } = require('./zoom-selectors');
+  const room = ZOOM.roomCodeFromUrl(zoomUrl);
+  if (!room) {
+    console.warn('[electron] Zoom: no meeting number in URL; room code not set —', zoomUrl);
+    return null;
+  }
+  localServer.setRoom(room);
+  sync.updateConfig({ roomId: room, baseUrl: getWebsiteUrl() });
+  console.log('[electron] Zoom room code:', room);
+  sync.ensureRoom().then((ok) => {
+    sync.startPolling();
+    console.log('[electron] Zoom room ensured:', room,
+      ok ? 'OK' : '(NOT created — log into ' + getWebsiteUrl() + ' so the bot can create rooms)');
+  }).catch((e) => console.warn('[electron] Zoom ensureRoom error:', e && e.message));
+  return room;
+}
+
+// Switch the embedded view to the Zoom web client and join the meeting (#318).
+// Any zoom.us link works: it's rewritten to the direct /wc/join/<n> URL, which
+// renders the meeting top-level where preload-zoom.js can reach it. preload-zoom
+// handles pre-join, computer audio and in-call reporting itself.
+function activateZoomProvider(zoomUrl) {
+  if (!mainWindow || mainWindow.isDestroyed()) return null;
+  const { ZOOM } = require('./zoom-selectors');
+  // A meeting link joins. Any other zoom.us page (e.g. https://zoom.us/signin)
+  // just loads, so the bot's Zoom account can be signed in to in this profile:
+  // a signed-in bot skips the guest join page and its reCAPTCHA.
+  let webUrl = ZOOM.webClientJoinUrl(zoomUrl);
+  const isMeeting = !!webUrl;
+  if (!isMeeting) {
+    let host = '';
+    try { host = new URL(zoomUrl).hostname.toLowerCase(); } catch { /* not a URL */ }
+    if (host !== 'zoom.us' && !host.endsWith('.zoom.us')) { console.warn('[electron] Zoom: not a zoom.us link —', zoomUrl); return null; }
+    webUrl = zoomUrl;
+  }
+  console.log('[electron] Activating Zoom provider:', webUrl);
+  destroyProviderView();
+  slackProviderMode = false;
+  slackSurface = null;
+  zoomProviderMode = true;
+  ensureMeetSessionConfigured(SESSION_PARTITION);
+  meetView = createMeetView(SESSION_PARTITION, { preload: 'preload-zoom.js' });
+  // The web client checks the browser; present as current Chrome (the same
+  // spoof the Slack surface uses; preload-zoom shims userAgentData to match).
+  meetView.webContents.setUserAgent(require('./slack-ua').UA);
+  meetView.webContents.on('console-message', (_e, _level, message) => {
+    if (typeof message === 'string' && message.includes('[zoom]')) console.log(message);
+  });
+  attachMeetViewForState();
+  layoutViews();
+  const room = isMeeting ? setupZoomRoom(zoomUrl) : null;
+  meetView.webContents.loadURL(webUrl);
+  return room;
 }
 
 // Let the avatar banner run to the very top of the window, behind the window
@@ -12029,6 +12124,12 @@ function createMainWindow() {
     meetView = createMeetView(SESSION_PARTITION);
   }
   attachMeetViewForState(); // #103: hidden host / popout / main window, per state
+  // Zoom (#318): --provider=zoom --zoom-url=<any zoom.us meeting link> joins at
+  // launch. Swaps the Meet view just built for a Zoom one.
+  if (cliArgs['provider'] === 'zoom') {
+    if (cliArgs['zoom-url']) activateZoomProvider(cliArgs['zoom-url']);
+    else console.warn('[electron] --provider=zoom needs --zoom-url=<meeting link>');
+  }
 
   // Open DevTools on demand from panel — registered once, references the
   // current module-level meetView so it always targets the live one after
@@ -12266,8 +12367,9 @@ function createMainWindow() {
   mainWindow.on('resize', layoutViews);
 
   // Load idle placeholder in the Meet view. In Slack mode the surface already
-  // loaded app.slack.com (or the channel deep-link) in createSlackSurface.
-  if (!slackMode) loadIdlePage('main-window created');
+  // loaded app.slack.com (or the channel deep-link) in createSlackSurface; in
+  // Zoom mode activateZoomProvider already loaded the meeting.
+  if (!slackMode && !zoomProviderMode) loadIdlePage('main-window created');
 
   // 'close' (cancellable) before 'closed' (already gone).
   mainWindow.on('close', confirmQuitBeforeClose);
@@ -12449,6 +12551,7 @@ async function _openMeetInFreshView(meetUrl, { guestFallback = false } = {}) {
   if (boundEmail) console.log('[electron] Pinning Meet account via authuser:', boundEmail);
 
   meetView = createMeetView(activeMeetPartition);
+  zoomProviderMode = false; // a Meet view replaces any Zoom one (#318)
   attachMeetViewForState(); // #103: hidden host / popout / main window, per state
   layoutViews();
 
@@ -13782,6 +13885,13 @@ function setupIPC() {
     return { signedIn };
   });
 
+  // Is this profile signed into Zoom (#318)? Same cookie-authoritative idea as
+  // Slack. A signed-in bot joins without the guest page and its reCAPTCHA.
+  ipcMain.handle('get-zoom-mode', async () => {
+    const signedIn = await isSignedInToZoom(session.fromPartition(SESSION_PARTITION));
+    return { signedIn };
+  });
+
   // Which Google account the bot is ACTUALLY signed in as (not just "signed in"
   // — the real email). Surfaces the gap that hid #250: the app knew the mode but
   // never the identity, so a silently-logged-out bot looked "signed in". Reads
@@ -14074,6 +14184,35 @@ function setupIPC() {
     activateSlackProvider('https://app.slack.com/', { autojoin: false });
     // Signing out drops you on Slack's login page, and the usual reason to sign
     // out is to sign back in as someone else — so show the view here too.
+    revealBotViewForSignIn();
+    return { ok: true };
+  });
+
+  // --- Bot Zoom identity (#318) — parity with Slack above. Opens Zoom's
+  // sign-in page in the bot's view (visible, #498) on the shared partition. ---
+  ipcMain.handle('zoom-sign-in', () => {
+    activateZoomProvider(ZOOM_SIGN_IN_URL);
+    revealBotViewForSignIn();
+    return { ok: true };
+  });
+
+  // Remove ONLY zoom.us cookies (Google and Slack logins preserved), then show
+  // the sign-in page, since signing out is usually a prelude to signing back in.
+  ipcMain.handle('zoom-sign-out', async () => {
+    try {
+      const sess = session.fromPartition(SESSION_PARTITION);
+      let removed = 0;
+      for (const c of await sess.cookies.get({})) {
+        const d = (c.domain || '').replace(/^\./, '');
+        if (/(^|\.)zoom\.us$/.test(d)) {
+          try { await sess.cookies.remove(`https://${d}${c.path || '/'}`, c.name); removed++; } catch { /* best-effort */ }
+        }
+      }
+      console.log('[electron] Zoom sign-out — removed', removed, 'zoom.us cookies (Google/Slack logins preserved)');
+    } catch (err) {
+      console.warn('[electron] zoom-sign-out failed:', err.message);
+    }
+    activateZoomProvider(ZOOM_SIGN_IN_URL);
     revealBotViewForSignIn();
     return { ok: true };
   });
