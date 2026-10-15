@@ -29,7 +29,7 @@
 // _render; tests/avatar-posture.test.mjs pins the two together.
 const FACE_FRAC = 0.77;
 
-const REST_OFFSET_X = 0.08;       // ± fraction of tile width
+const REST_OFFSET_X = 0.15;       // ± fraction of tile width (Stan: sideways is where tiles have room)
 const REST_OFFSET_Y = 0.06;       // ± fraction of tile height (the face fills more of it)
 const REST_SCALE_MIN = 0.9;
 const REST_SCALE_MAX = 1.1;
