@@ -9533,29 +9533,38 @@ app.whenReady().then(async () => {
       profileStore.set('onboardingCallComplete', false);
     }
 
-    // A brand-new bot otherwise ships with the plain animated gradient — the
-    // SAME one every other unconfigured bot has, which makes the switcher
-    // useless for telling several fresh bots apart at a glance. Seed one of
-    // the bundled presets at random instead, right here at the one moment a
-    // profile is genuinely new — covers every path that creates a bot ("New
-    // bot…", /call-new-bot, and the very first default-profile launch), since
-    // they all funnel through this same per-process startup.
-    if (isBrandNewProfile && !profileStore.get('avatarBackgroundSvg')) {
-      try {
-        const bgDir = __dirname.includes('.asar')
-          ? path.join(process.resourcesPath, 'backgrounds', 'presets')
-          : path.join(__dirname, 'backgrounds', 'presets');
-        const BG_EXTS = /\.(svg|png|jpe?g|webp|gif)$/i;
-        const files = fs.readdirSync(bgDir).filter((f) => BG_EXTS.test(f));
-        if (files.length) {
-          const chosen = files[Math.floor(Math.random() * files.length)];
-          const svg = await buildBackgroundSvgFromImage(path.join(bgDir, chosen));
-          profileStore.set('avatarBackgroundSvg', svg);
-          profileStore.set('avatarBackgroundCaption', chosen.replace(BG_EXTS, ''));
+    // A new bot gets one of the bundled background presets at random instead
+    // of the plain gradient every unconfigured bot shares. "New" means EITHER
+    // no config.json existed at all (bare --profile launch, first default
+    // profile) OR seedNewBotName left its one-shot marker: "New bot…" and
+    // /call-new-bot pre-seed config.json before this instance starts, so
+    // isBrandNewProfile is already false for them. See new-bot-background.js
+    // for why a marker rather than inferring it from an empty background.
+    {
+      const nbb = require('./new-bot-background.js');
+      const marker = profileStore.get(nbb.SEED_BACKGROUND_MARKER);
+      if (nbb.shouldSeedRandomBackground({
+        isBrandNewProfile,
+        marker,
+        currentSvg: profileStore.get('avatarBackgroundSvg'),
+      })) {
+        try {
+          const bgDir = __dirname.includes('.asar')
+            ? path.join(process.resourcesPath, 'backgrounds', 'presets')
+            : path.join(__dirname, 'backgrounds', 'presets');
+          const chosen = nbb.pickBackgroundPreset(fs.readdirSync(bgDir));
+          if (chosen) {
+            const svg = await buildBackgroundSvgFromImage(path.join(bgDir, chosen));
+            profileStore.set('avatarBackgroundSvg', svg);
+            profileStore.set('avatarBackgroundCaption', nbb.presetCaption(chosen));
+          }
+        } catch (err) {
+          console.warn('[config] could not seed a random background for new bot:', err.message);
         }
-      } catch (err) {
-        console.warn('[config] could not seed a random background for new bot:', err.message);
       }
+      // One shot, success or not: once consumed, an empty background is the
+      // user's choice (or a failed seed) and must never be re-rolled.
+      if (marker !== undefined) profileStore.delete(nbb.SEED_BACKGROUND_MARKER);
     }
   }
 
@@ -13652,6 +13661,11 @@ function setupIPC() {
       // needed — which means a genuinely NEW bot has to say otherwise
       // explicitly, right here, at the one moment it's actually created.
       const seeded = { ...existing, botName, onboardingCallComplete: false };
+      // The new instance's startup sees this config.json and so does NOT treat
+      // the profile as brand new; this marker is what tells it to seed a random
+      // background preset (consumed on that first launch, see
+      // new-bot-background.js).
+      seeded[require('./new-bot-background.js').SEED_BACKGROUND_MARKER] = true;
       if (adopt && adopt.workdir) seeded.claudeWorkDir = adopt.workdir;
       if (adopt && adopt.session) seeded.agentSession = adopt.session;
       fs.writeFileSync(file, JSON.stringify(seeded, null, 2));
