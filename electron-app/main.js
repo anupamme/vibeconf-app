@@ -9180,7 +9180,7 @@ function ensureClaudeIntegration() {
 
   // --- Ensure global skill in ~/.claude/skills/join-call/ ---
   // Version-tracked: updates when app version changes
-  const SKILL_VERSION = '66';  // Bump this when updating the skill content below
+  const SKILL_VERSION = '67';  // Bump this when updating the skill content below
   const versionFile = path.join(skillDir, '.version');
   let installedVersion = '';
   try { installedVersion = fs.readFileSync(versionFile, 'utf-8').trim(); } catch {}
@@ -9556,6 +9556,24 @@ app.whenReady().then(async () => {
     // run for this profile before.
     if (isBrandNewProfile && profileStore.get('onboardingCallComplete') === undefined) {
       profileStore.set('onboardingCallComplete', false);
+    }
+
+    // A brand-new DEFAULT-profile bot with no --bot-name would otherwise join
+    // its first call as "Unnamed bot" (a named --profile humanizes its dir name
+    // instead; "New bot…" and the first-run wizard seed a name already). The
+    // guided setup no longer asks for a name: it shows the one the bot already
+    // has, and Meet takes the display name at JOIN, so a name picked in-call
+    // would leave the tile wrong until a leave+rejoin. Seed it here, before any
+    // join, so the tile is right from the first frame. Only a brand-new
+    // profile: a stray instance of an existing one must still read "Unnamed
+    // bot" (bot-name-default.test.mjs).
+    if (isBrandNewProfile && isDefaultInstance && !cliArgs['bot-name'] && !profileStore.get('botName')) {
+      try {
+        const { randomBotName } = require('./bot-names.js');
+        profileStore.set('botName', randomBotName({ taken: takenBotNames() }));
+      } catch (err) {
+        console.warn('[config] could not seed a random name for new bot:', err.message);
+      }
     }
 
     // A new bot gets one of the bundled background presets at random instead
