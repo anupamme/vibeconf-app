@@ -51,7 +51,10 @@ test('Step 2 picks every default without asking', () => {
   }
   // Background reuses the random preset main.js seeds for every new bot.
   assert.match(step2, /avatarBackgroundCaption[^|]*random preset/);
-  assert.match(main, /if \(isBrandNewProfile && !profileStore\.get\('avatarBackgroundSvg'\)\)/);
+  // Either form of the seed: the original brand-new-only check, or #817's
+  // (new bots get a random background) marker-aware one, so this PR and that
+  // one can land in either order.
+  assert.match(main, /if \(isBrandNewProfile && !profileStore\.get\('avatarBackgroundSvg'\)\)|shouldSeedRandomBackground\(/);
 });
 
 test('ONE card, sized for one unscrollable screen, inviting changes', () => {
