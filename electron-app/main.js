@@ -3840,20 +3840,37 @@ async function buildBackgroundSvgFromImage(filePath) {
     '</svg>';
 }
 
+// The Meet view's webContents if it is still alive, else null. Re-read it after
+// every await: the guest-join fallback (#347 guest join, #795 anonymous guest)
+// tears meetView down and builds a new one while an async caller is suspended,
+// so a check made BEFORE the await says nothing about the view AFTER it.
+function liveMeetWc() {
+  return meetView && !meetView.webContents.isDestroyed() ? meetView.webContents : null;
+}
+
 async function pushAvatarBackground(svgSource) {
-  if (!meetView || meetView.webContents.isDestroyed()) return;
+  if (!liveMeetWc()) return;
   try {
     const resolved = (typeof svgSource === 'string' && svgSource.trim())
       ? await resolveSvg(svgSource)
       : '';
-    meetView.webContents.send('extension-message', {
+    // resolveSvg reads file:// images; the guest fallback can replace meetView
+    // during that read. The old pre-await guard let this hit a null view, and the
+    // catch below then hit it again, escaping as an unhandledRejection whose
+    // panel error buried the "sign the bot in" warning (2026-10-15).
+    const wc = liveMeetWc();
+    if (!wc) return;
+    wc.send('extension-message', {
       action: 'set-avatar-background',
       payload: { svg: resolved },
     });
   } catch (err) {
     console.warn('[electron] Failed to resolve avatar background SVG:', err.message);
-    // Fall back to clearing — renderer goes back to default gradient.
-    meetView.webContents.send('extension-message', {
+    // Fall back to clearing — renderer goes back to default gradient. Same
+    // re-check: the view may be gone by now, and a throw here is unhandled.
+    const wc = liveMeetWc();
+    if (!wc) return;
+    wc.send('extension-message', {
       action: 'set-avatar-background',
       payload: { svg: '' },
     });
@@ -4661,7 +4678,15 @@ async function setRunwayFace(seat, on) {
         try { await mod.endAvatarSession({ sessionId: s.sessionId, roomName: s.roomName }); } catch (e) {}
         return;
       }
-      meetView.webContents.send('runway-avatar', { type: 'connect', url: s.livekitUrl, token: s.botToken });
+      // Re-check after the awaits: the guest fallback can replace meetView while
+      // the session is being minted. End what we created rather than leak it, and
+      // throw so the catch's 30s retry runs against the new view.
+      const wc = liveMeetWc();
+      if (!wc) {
+        try { await mod.endAvatarSession({ sessionId: s.sessionId, roomName: s.roomName }); } catch (e) {}
+        throw new Error('Meet view went away while minting the avatar session');
+      }
+      wc.send('runway-avatar', { type: 'connect', url: s.livekitUrl, token: s.botToken });
       // Log session + avatar ids — the 06-29 post-mortem stalled because neither was on the record.
       console.log('[runway] face', prevSession ? 'RENEWED' : 'ON', 'for', seat, '→ room', s.roomName, 'gen', gen, 'session', s.sessionId, 'avatar', (mod.AVATARS || {})[seat]);
       st.sessionId = s.sessionId; st.roomName = s.roomName; st.mod = mod;
