@@ -10635,9 +10635,8 @@ app.whenReady().then(async () => {
         else if (latestCalendarFeedStatus.state !== 'off') console.log('[calendar] iCal feed: removed');
       }
       latestCalendarFeedStatus = status;
-      if (panelView && !panelView.webContents.isDestroyed()) {
-        panelView.webContents.send('calendar-feed-status', status);
-      }
+      // Every window, not just the panel: the field lives in App Settings.
+      broadcastToRenderers('calendar-feed-status', status);
       return events;
     }
 

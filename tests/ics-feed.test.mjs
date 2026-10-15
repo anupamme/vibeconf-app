@@ -212,3 +212,12 @@ test('the feed URL never reaches the session log or the agent-facing schema', ()
   assert.ok(!lines.includes('SECRET-TOKEN'), 'feed URL leaked into the prefs log');
   assert.match(lines, /calendarFeedSecretUrl=<redacted>/);
 });
+
+test('the feed is app-wide (it is the person’s calendar, not a bot’s) and a headless --config can set it', () => {
+  const { isAppLevel } = require('../electron-app/config-scope.js');
+  assert.equal(isAppLevel('calendarFeedSecretUrl'), true);
+  const { checkConfigObject } = require('../electron-app/config-file.js');
+  const r = checkConfigObject({ calendarFeedSecretUrl: 'https://example.test/cal.ics' });
+  assert.equal(r.ok, true, r.errors.join('; '));
+  assert.deepEqual(r.entries.map((e) => [e.key, e.appLevel, e.secret]), [['calendarFeedSecretUrl', true, true]]);
+});
