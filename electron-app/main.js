@@ -5473,7 +5473,9 @@ function getWebsiteUrl() {
 // triggered by one (#299) — recorded on the local server (setRoom clears any
 // prior one first) so get_room_info can tell the spawned agent WHY it's
 // here, instead of it walking into the call cold.
-function joinMeetUrl(meetUrl, { spawnAgent = true, onboardingCall = false, calendarEvent = null } = {}) {
+// summoned: brought into a call already in progress by /call-new-bot — see
+// launchClaudeTerminal.
+function joinMeetUrl(meetUrl, { spawnAgent = true, onboardingCall = false, calendarEvent = null, summoned = false } = {}) {
   currentMeetUrl = meetUrl;
   loadMeetURL(meetUrl);
 
@@ -5491,9 +5493,101 @@ function joinMeetUrl(meetUrl, { spawnAgent = true, onboardingCall = false, calen
     // calendarEvent rides along for #570: its invitees are what a per-meeting
     // session is keyed on. Only this path has it — a panel join or a pasted
     // link has no event, and so keeps the bot's single session.
-    launchClaudeTerminal(meetCode, { onboardingCall, calendarEvent }); // the agent behind the face
+    launchClaudeTerminal(meetCode, { onboardingCall, calendarEvent, summoned }); // the agent behind the face
   } else {
     console.log('[electron] Agent terminal not spawned — the caller is already an agent');
+  }
+}
+
+// The AppleScript that lists Meet / Slack / blank tabs in Chrome, Safari and
+// Brave. Shared by the background Meet poll (startMeetDetection) and the
+// one-shot scanBrowserMeetUrls below, so the perf lessons recorded in
+// startMeetDetection (no System Events, batched tab reads) apply to both.
+function browserTabScanScript() {
+  const browserScanBlock = (appName) => `
+if application "${appName}" is running then
+  try
+    tell application "${appName}"
+      repeat with w in windows
+        try
+          set tabURLs to URL of tabs of w
+          set tabTitles to title of tabs of w
+          repeat with i from 1 to count of tabURLs
+            try
+              set tabURL to (item i of tabURLs) as text
+              set tabTitle to ""
+              try
+                set tabTitle to (item i of tabTitles) as text
+              end try
+              if tabURL starts with "https://meet.google.com/" then
+                set allURLs to allURLs & "MEET:" & tabURL & linefeed
+              else if tabURL starts with "https://app.slack.com/client/" then
+                set allURLs to allURLs & "SLACK:" & tabURL & "|||" & tabTitle & linefeed
+              else if tabURL is "about:blank" then
+                set allURLs to allURLs & "BLANK:" & tabTitle & linefeed
+              end if
+            end try
+          end repeat
+        end try
+      end repeat
+    end tell
+  end try
+end if`;
+  const appleScript = `
+set allURLs to ""
+${browserScanBlock('Google Chrome')}
+${browserScanBlock('Safari')}
+${browserScanBlock('Brave Browser')}
+allURLs`;
+  return appleScript;
+}
+
+// One-shot scan for Meet URLs open in the user's browser, for /call-new-bot.
+// The background poll can't answer this: it deliberately stops while THIS
+// instance is in a call, which is exactly when someone summons a second bot.
+// Resolves [] on any failure (no Automation permission, not macOS, a timeout) —
+// the caller treats "no tabs" as "start a fresh call", and a scan error is not
+// a reason to refuse that.
+function scanBrowserMeetUrls({ timeoutMs = 8000 } = {}) {
+  if (process.platform !== 'darwin') return Promise.resolve([]);
+  const { execFile } = require('child_process');
+  return new Promise((resolve) => {
+    execFile('osascript', ['-e', browserTabScanScript()], { timeout: timeoutMs }, (err, stdout) => {
+      if (err) {
+        console.log('[call-new-bot] browser tab scan failed:', (err.killed ? 'timeout' : err.message || '').slice(0, 120));
+        resolve([]);
+        return;
+      }
+      resolve(String(stdout || '').split('\n').map((l) => l.trim())
+        .filter((l) => l.startsWith('MEET:')).map((l) => l.slice(5)));
+    });
+  });
+}
+
+// Join a call at launch because /call-new-bot asked for it (--join-url, plus
+// --summoned=true when the call was already in progress). Same paths the
+// panel's own join buttons take, agent included: this instance was just
+// created, so nothing else is driving it. A FRESH Meet is created by the
+// instance that received /call-new-bot (it is already signed in) and arrives
+// here as an ordinary --join-url.
+function joinSummonedCall({ url = null, summoned = false } = {}) {
+  try {
+    if (!url) return;
+    const { parseCallTarget } = require('./new-bot-target.js');
+    const t = parseCallTarget(url);
+    if (!t.ok) { console.warn('[call-new-bot]', t.error); return; }
+    console.log(`[call-new-bot] joining ${t.provider} call${summoned ? ' already in progress' : ''}`);
+    if (t.provider === 'meet') {
+      joinMeetUrl(t.url, { summoned });
+      return;
+    }
+    const activate = { slack: (u) => { activateSlackProvider(u, { autojoin: true }); return localServer.roomId; },
+      zoom: (u) => activateZoomProvider(u), teams: (u) => activateTeamsProvider(u) }[t.provider];
+    const room = activate && activate(t.url);
+    if (room) launchClaudeTerminal(room, { summoned });
+    else console.warn('[call-new-bot] not a joinable', t.provider, 'link; skipping');
+  } catch (err) {
+    console.warn('[call-new-bot] join at launch failed:', err.message);
   }
 }
 
@@ -6421,7 +6515,7 @@ function configureMeetSession(sess) {
 // ---------------------------------------------------------------------------
 
 // Flags that take a value; used to catch the silently-ignored space form below.
-const KNOWN_VALUE_FLAGS = new Set(['profile', 'local-port', 'website-url', 'meet-url', 'bot-name', 'bot-view']);
+const KNOWN_VALUE_FLAGS = new Set(['profile', 'local-port', 'website-url', 'meet-url', 'join-url', 'bot-name', 'bot-view']);
 
 function parseCLIArgs() {
   const args = process.argv.slice(1); // skip electron binary
@@ -7932,7 +8026,10 @@ function notifyClaudeSignInNeeded() {
   }).catch(() => { /* dismissed */ });
 }
 
-async function launchClaudeTerminal(meetCode, { onboardingCall = false, calendarEvent = null } = {}) {
+// summoned: this bot was brought into a call ALREADY in progress by
+// /call-new-bot. The agent starts with `/join-call <code> --summoned`, which
+// skips /join-call's onboarding hand-off — see joinSlashCommand in agent-spawn.js.
+async function launchClaudeTerminal(meetCode, { onboardingCall = false, calendarEvent = null, summoned = false } = {}) {
   const { execFile } = require('child_process');
   // Test fleets drive the bot from the harness over MCP — they have no use for a
   // spawned agent, and every start_call left another Terminal window on the
@@ -8125,14 +8222,16 @@ async function launchClaudeTerminal(meetCode, { onboardingCall = false, calendar
   const resumeFlag = claudeResumeFlag(plan.resumeSessionId);
   const nameFlag = claudeNameFlag(plan.sessionName);
   const slashCmd = onboardingCall ? 'onboarding-call' : 'join-call';
-  const claudeCmd = `claude${resumeFlag}${nameFlag}${dangerousFlag}${modelFlag}${mcpFlags} \\"/${slashCmd} ${meetCode} ${botName.replace(/"/g, '')}\\"`;
+  const { joinSlashCommand } = require('./agent-spawn.js');
+  const slashLine = joinSlashCommand({ slashCmd, meetCode, botName: botName.replace(/"/g, ''), summoned });
+  const claudeCmd = `claude${resumeFlag}${nameFlag}${dangerousFlag}${modelFlag}${mcpFlags} \\"${slashLine}\\"`;
 
   // #242: run the agent as our own child instead, when asked to. Everything
   // above (detection, auth nag, workdir, MCP config, bot name) is shared — the
   // only difference is who owns the process and therefore who can see it work.
   if (store.get('agentHosting') === 'headless') {
     const launched = launchClaudeHeadless({
-      meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall,
+      meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall, summoned,
     });
     // Falling through to the Terminal path on refusal is deliberate. The
     // alternative is joining a call with an agent that never starts, which
@@ -8154,7 +8253,7 @@ async function launchClaudeTerminal(meetCode, { onboardingCall = false, calendar
   // then headless, then a loud failure — never a silent no-agent.
   if (process.platform === 'linux') {
     const launched = launchClaudeLinuxTerminal({
-      meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall,
+      meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall, summoned,
     });
     if (launched) return;
     // No terminal emulator AND no tmux. Headless is the last automatic option,
@@ -8162,7 +8261,7 @@ async function launchClaudeTerminal(meetCode, { onboardingCall = false, calendar
     // the allowlist mode that would make this refusal much rarer).
     console.log('[electron] no Linux terminal available — trying headless');
     const headless = launchClaudeHeadless({
-      meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall,
+      meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall, summoned,
     });
     if (headless) return;
     // Loud, because the alternative is the failure this whole issue exists to
@@ -8317,7 +8416,7 @@ function binaryExists(bin) {
 // Returns true if the agent is now running in a Linux terminal, false to fall
 // back to headless. See linux-terminal.js for the shapes and why tmux is an
 // upgrade rather than a requirement.
-function launchClaudeLinuxTerminal({ meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall = false }) {
+function launchClaudeLinuxTerminal({ meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall = false, summoned = false }) {
   const { spawn, execFileSync } = require('child_process');
   const {
     detectTerminalEmulator, chooseAgentTerminalPlan, tmuxSessionName,
@@ -8350,6 +8449,7 @@ function launchClaudeLinuxTerminal({ meetCode, botName, claudeDir, dangerousMode
     mcpConfigPath,
     ...planAgentSession(claudeDir, botName),
     onboardingCall,
+    summoned,
   })];
 
   // Same env contract as the headless spawn: strip the parent Claude session's
@@ -8442,7 +8542,7 @@ let headlessAgentCallOver = false;
 let headlessAgentGeneration = 0;
 
 // Returns true if the agent is now running headlessly, false to fall back.
-function launchClaudeHeadless({ meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall = false }) {
+function launchClaudeHeadless({ meetCode, botName, claudeDir, dangerousMode, claudeBin, mcpConfigPath, onboardingCall = false, summoned = false }) {
   const { buildAgentArgs, headlessBlockedReason, spawnHeadlessAgent } = require('./agent-spawn.js');
 
   const blocked = headlessBlockedReason({ dangerous: dangerousMode });
@@ -8531,6 +8631,7 @@ function launchClaudeHeadless({ meetCode, botName, claudeDir, dangerousMode, cla
     mcpConfigPath,
     ...planAgentSession(claudeDir, botName),
     onboardingCall,
+    summoned,
   });
 
   // The stream becomes the activity source BEFORE the spawn, so the very first
@@ -9155,7 +9256,7 @@ function ensureClaudeIntegration() {
 
   // --- Ensure global skill in ~/.claude/skills/join-call/ ---
   // Version-tracked: updates when app version changes
-  const SKILL_VERSION = '66';  // Bump this when updating the skill content below
+  const SKILL_VERSION = '68';  // Bump this when updating the skill content below
   const versionFile = path.join(skillDir, '.version');
   let installedVersion = '';
   try { installedVersion = fs.readFileSync(versionFile, 'utf-8').trim(); } catch {}
@@ -9935,41 +10036,7 @@ app.whenReady().then(async () => {
     // Per-window try blocks skip a misbehaving window without aborting the
     // whole scan; the per-item try skips tabs whose URL is `missing value`
     // (empty Safari tabs).
-    const browserScanBlock = (appName) => `
-if application "${appName}" is running then
-  try
-    tell application "${appName}"
-      repeat with w in windows
-        try
-          set tabURLs to URL of tabs of w
-          set tabTitles to title of tabs of w
-          repeat with i from 1 to count of tabURLs
-            try
-              set tabURL to (item i of tabURLs) as text
-              set tabTitle to ""
-              try
-                set tabTitle to (item i of tabTitles) as text
-              end try
-              if tabURL starts with "https://meet.google.com/" then
-                set allURLs to allURLs & "MEET:" & tabURL & linefeed
-              else if tabURL starts with "https://app.slack.com/client/" then
-                set allURLs to allURLs & "SLACK:" & tabURL & "|||" & tabTitle & linefeed
-              else if tabURL is "about:blank" then
-                set allURLs to allURLs & "BLANK:" & tabTitle & linefeed
-              end if
-            end try
-          end repeat
-        end try
-      end repeat
-    end tell
-  end try
-end if`;
-    const appleScript = `
-set allURLs to ""
-${browserScanBlock('Google Chrome')}
-${browserScanBlock('Safari')}
-${browserScanBlock('Brave Browser')}
-allURLs`;
+    const appleScript = browserTabScanScript();
 
     console.log('[electron] Meet/Slack detection started');
 
@@ -10582,6 +10649,12 @@ allURLs`;
       if (room) launchClaudeTerminal(room);
       else console.warn('[electron] ' + channel + ': not a joinable ' + label + ' link; skipping');
     });
+  }
+
+  // /call-new-bot: a new bot launched straight into a call. Not --meet-url,
+  // which loads the page but starts no agent — a face with nobody behind it.
+  if (cliArgs['join-url']) {
+    joinSummonedCall({ url: cliArgs['join-url'], summoned: cliArgs['summoned'] === 'true' });
   }
 
   // Auto-join if launched with --meet-url
@@ -13533,6 +13606,24 @@ function setupIPC() {
     return running;
   }
 
+  // The same scan, but with what each instance is DOING: its call status and
+  // room. /call-new-bot reads this to find a call already in progress.
+  async function scanCallInstances() {
+    const running = await scanRunningInstances();
+    const out = await Promise.all(Object.entries(running).map(async ([profile, port]) => {
+      try {
+        const ctrl = new AbortController();
+        const t = setTimeout(() => ctrl.abort(), 900);
+        const r = await fetch(`http://127.0.0.1:${port}/api/sync/no-room`, { signal: ctrl.signal });
+        clearTimeout(t);
+        if (!r.ok) return null;
+        const j = await r.json();
+        return { profile, port, callStatus: j?.status?.callStatus || null, roomId: j?.roomId || null };
+      } catch { return null; }
+    }));
+    return out.filter(Boolean);
+  }
+
   ipcMain.handle('list-profiles', async () => {
     const named = profileManager.listProfiles(PROFILES_ROOT);
     const reg = profileManager.loadPortRegistry(BASE_USER_DATA);
@@ -13664,7 +13755,9 @@ function setupIPC() {
     }
   }
 
-  async function launchOrFocusProfile(name, { openSettings = false } = {}) {
+  // extraArgs: further --flags for a FRESH launch only (a running profile is
+  // focused, never relaunched — so they can't move a bot out of its call).
+  async function launchOrFocusProfile(name, { openSettings = false, extraArgs = [] } = {}) {
     const isDefault = isDefaultName(name);
     if (!profileManager.isValidProfileName(name)) {
       return { ok: false, error: 'Invalid profile name (letters, numbers, . _ - only)' };
@@ -13700,6 +13793,7 @@ function setupIPC() {
     // A newly created bot lands on Settings rather than "Call now" — it has no
     // name, voice or face yet, so that page IS its next step.
     if (openSettings) args = [...args, '--open-settings=true'];
+    if (extraArgs.length) args = [...args, ...extraArgs];
 
     // #379: open the new profile window where THIS one is, not centered. The main
     // window honors --window-x/y (createMainWindow, as the test launcher uses),
@@ -13832,7 +13926,19 @@ function setupIPC() {
   // said out loud (see addressable-name.js) — it is the user's existing word
   // for this thing, so it beats a random one. When it cannot, the random pool
   // takes over rather than shipping a bot that never answers to itself.
-  adoptSessionAsBot = async ({ workdir, session, botName } = {}) => {
+  //
+  // And it joins a call (/call-new-bot, 2026-10-15). `target` is an explicit
+  // Meet code/URL, Slack huddle, Zoom or Teams link; without one, the call some
+  // running instance is in, then a Meet open in the user's browser, then a
+  // fresh Meet. Several distinct candidates → { needsChoice, candidates } and
+  // NOTHING is created, so the caller can ask and come back with a target. The
+  // order lives in new-bot-target.js. `join: false` keeps the old create-only
+  // behaviour.
+  //
+  // Always a NEW profile on its own port. Never /join-call's path, which drives
+  // an EXISTING instance — with one running, an unknown name there is a rename
+  // of that bot, which pulls it out of the call it is in.
+  adoptSessionAsBot = async ({ workdir, session, botName, target = null, join = true } = {}) => {
     const dir = String(workdir || '').trim();
     if (!dir) return { ok: false, error: 'A working directory is required — that is where the session lives.' };
     if (!fs.existsSync(dir)) return { ok: false, error: `No such directory: ${dir}` };
@@ -13840,10 +13946,72 @@ function setupIPC() {
     // a session name means nothing without the directory it was recorded in.
     const { resolveSessionName } = require('./agent-session.js');
     const sessionRef = resolveSessionName(session) || '';
+
+    // Decide the call BEFORE creating anything: an ambiguous answer has to go
+    // back to the user, and a bot made in the meantime would be an orphan.
+    let call = null;
+    if (join !== false) {
+      const { resolveNewBotTarget } = require('./new-bot-target.js');
+      const explicit = target && String(target).trim() ? String(target).trim() : null;
+      // Only look around when nothing was named; the scans cost seconds.
+      const instances = explicit ? [] : await scanCallInstances();
+      let decided = resolveNewBotTarget({ explicit, instances });
+      // The browser is only consulted when no instance is in a call, so the
+      // AppleScript scan (and any Automation prompt) is skipped when unneeded.
+      if (decided.action === 'new') {
+        decided = resolveNewBotTarget({ explicit, instances, browserMeetUrls: await scanBrowserMeetUrls() });
+      }
+      if (decided.action === 'error') return { ok: false, error: decided.error };
+      if (decided.action === 'ask') {
+        return {
+          ok: false,
+          needsChoice: true,
+          source: decided.source,
+          candidates: decided.candidates,
+          error: `More than one call is in progress (${decided.candidates.map((c) => c.roomId).join(', ')}). Say which one, and pass it as target.`,
+        };
+      }
+      if (decided.action === 'new') {
+        // Made HERE, not by the new instance: this one is running and signed in,
+        // while a profile that has existed for half a second may not have its
+        // login cookie yet. The new bot then joins it like any other link.
+        const r = await websiteRequest('/api/meet/create', {
+          method: 'POST',
+          headers: { 'Idempotency-Key': require('crypto').randomUUID() },
+        });
+        if (!(r.status === 200 && r.json?.meetingUri)) {
+          const why = { 401: 'not signed in to vibeconferencing.com', 429: 'too many calls started recently', 502: 'Google could not create the room' }[r.status]
+            || (r.status === 0 ? `offline (${r.error})` : `status ${r.status}`);
+          return { ok: false, error: `No call to join, and a new one could not be started: ${why}.` };
+        }
+        call = { source: 'new', url: r.json.meetingUri, summoned: false };
+      } else {
+        // A call someone is already in. The bot joins as a participant, not
+        // through its guided setup — see joinSlashCommand.
+        call = { source: decided.source, url: decided.url, roomId: decided.roomId, summoned: true };
+      }
+    }
+
     const name = nextBotProfileName();
     seedNewBotName(name, { workdir: dir, session: sessionRef, botName });
-    const result = await launchOrFocusProfile(name, { openSettings: true });
-    return { ...result, profile: name, adopted: { workdir: dir, session: sessionRef } };
+    const extraArgs = call ? [`--join-url=${call.url}`, ...(call.summoned ? ['--summoned=true'] : [])] : [];
+    // Joining → the window opens on the call, not on Settings.
+    const result = await launchOrFocusProfile(name, { openSettings: !call, extraArgs });
+    if (call && result.ok && !result.launched) {
+      // nextBotProfileName picks an unused directory, so this should not
+      // happen — but if it did, the "new" bot is a running one, and it must
+      // not be redirected out of whatever it is doing.
+      return { ok: false, error: `Profile ${name} was already running, so no new bot was made. Nothing was joined.` };
+    }
+    if (call && result.ok && call.source === 'new') openExternalUrl(call.url);
+    return {
+      ...result,
+      profile: name,
+      adopted: { workdir: dir, session: sessionRef },
+      // The link is reported for a call we MADE (the user needs it); a call
+      // already in progress is reported by room only.
+      call: call ? { source: call.source, roomId: call.roomId || null, ...(call.source === 'new' ? { url: call.url } : {}) } : null,
+    };
   };
   ipcMain.handle('adopt-session-as-bot', async (_event, args) => adoptSessionAsBot(args));
 
